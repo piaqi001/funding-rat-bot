@@ -1,0 +1,417 @@
+import logging
+from typing import Dict, List, Optional
+from decimal import Decimal
+from binance.spot import Spot
+from binance.um_futures import UMFutures
+from binance.error import ClientError
+from ..config import settings
+
+logger = logging.getLogger(__name__)
+
+
+class BinanceClient:
+    """币安交易所客户端封装"""
+    
+    def __init__(self):
+        self.api_key = settings.BINANCE_API_KEY
+        self.api_secret = settings.BINANCE_API_SECRET
+        self.testnet = settings.BINANCE_TESTNET
+        self.client: Optional[UMFutures] = None
+        
+    async def initialize(self):
+        """初始化客户端"""
+        try:
+            # 使用币安 U本位合约
+            if self.testnet:
+                self.client = UMFutures(
+                    key=self.api_key,
+                    secret=self.api_secret,
+                    base_url="https://testnet.binancefuture.com"
+                )
+            else:
+                self.client = UMFutures(
+                    key=self.api_key,
+                    secret=self.api_secret
+                )
+            logger.info("币安客户端初始化成功")
+        except Exception as e:
+            logger.error(f"币安客户端初始化失败: {e}")
+            raise
+    
+    async def get_funding_rate(self, symbol: str) -> Optional[Decimal]:
+        """
+        获取指定交易对的资金费率
+        
+        Args:
+            symbol: 交易对，如 'BTCUSDT'
+            
+        Returns:
+            资金费率 (Decimal) 或 None
+        """
+        try:
+            # 币安交易对格式转换 BTCUSDC -> BTCUSDT
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            
+            result = self.client.funding_rate(symbol=binance_symbol, limit=1)
+            if result:
+                funding_rate = Decimal(str(result[0]['fundingRate']))
+                return funding_rate
+            return None
+        except ClientError as e:
+            logger.error(f"获取币安资金费率失败: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"获取币安资金费率异常: {e}")
+            return None
+    
+    async def get_all_funding_rates(self) -> Dict[str, Decimal]:
+        """
+        获取所有交易对的资金费率
+        
+        Returns:
+            字典 {symbol: funding_rate}
+        """
+        try:
+            result = self.client.funding_rate()
+            rates = {}
+            for item in result:
+                symbol = item['symbol'].replace('USDT', 'USDC')  # 统一为 USDC
+                rate = Decimal(str(item['fundingRate']))
+                rates[symbol] = rate
+            return rates
+        except Exception as e:
+            logger.error(f"获取币安所有资金费率异常: {e}")
+            return {}
+    
+    async def get_price(self, symbol: str) -> Optional[Decimal]:
+        """
+        获取指定交易对的最新价格
+        
+        Args:
+            symbol: 交易对
+            
+        Returns:
+            价格 (Decimal) 或 None
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            result = self.client.ticker_price(symbol=binance_symbol)
+            price = Decimal(str(result['price']))
+            return price
+        except Exception as e:
+            logger.error(f"获取币安价格异常: {e}")
+            return None
+    
+    async def get_max_leverage(self, symbol: str) -> int:
+        """
+        获取指定交易对的最大杠杆
+        
+        Args:
+            symbol: 交易对
+            
+        Returns:
+            最大杠杆倍数
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            result = self.client.leverage_brackets(symbol=binance_symbol)
+            if result:
+                # 返回第一档的最大杠杆
+                return result[0]['brackets'][0]['initialLeverage']
+            return 20  # 默认值
+        except Exception as e:
+            logger.error(f"获取币安最大杠杆失败: {e}")
+            return 20
+    
+    async def set_leverage(self, symbol: str, leverage: int) -> bool:
+        """
+        设置杠杆
+        
+        Args:
+            symbol: 交易对
+            leverage: 杠杆倍数
+            
+        Returns:
+            是否成功
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            self.client.change_leverage(symbol=binance_symbol, leverage=leverage)
+            logger.info(f"币安设置杠杆成功: {symbol} {leverage}x")
+            return True
+        except Exception as e:
+            logger.error(f"币安设置杠杆失败: {e}")
+            return False
+    
+    async def create_order(
+        self,
+        symbol: str,
+        side: str,  # 'long' or 'short'
+        amount: Decimal,
+        order_type: str = "MARKET",
+        price: Optional[Decimal] = None,
+        leverage: int = 1
+    ) -> Optional[Dict]:
+        """
+        创建订单
+        
+        Args:
+            symbol: 交易对
+            side: 方向 'long' 或 'short'
+            amount: 数量（USDT 金额，非币数量）
+            order_type: 订单类型 'MARKET' 或 'LIMIT'
+            price: 价格（限价单需要）
+            leverage: 杠杆倍数
+            
+        Returns:
+            订单信息字典或 None
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            
+            # 设置杠杆
+            await self.set_leverage(symbol, leverage)
+            
+            # 转换方向: long -> BUY, short -> SELL
+            binance_side = "BUY" if side == "long" else "SELL"
+            
+            # 获取当前价格用于计算数量
+            current_price = await self.get_price(symbol)
+            if not current_price:
+                logger.error("无法获取当前价格")
+                return None
+            
+            # 计算币数量 = USDT金额 / 价格
+            quantity = float(amount / current_price)
+            
+            # 获取交易对信息以确定精度
+            exchange_info = self.client.exchange_info()
+            symbol_info = next(
+                (s for s in exchange_info['symbols'] if s['symbol'] == binance_symbol),
+                None
+            )
+            if symbol_info:
+                quantity_precision = symbol_info['quantityPrecision']
+                quantity = round(quantity, quantity_precision)
+            
+            # 创建订单
+            if order_type == "MARKET":
+                result = self.client.new_order(
+                    symbol=binance_symbol,
+                    side=binance_side,
+                    type="MARKET",
+                    quantity=quantity
+                )
+            else:  # LIMIT
+                result = self.client.new_order(
+                    symbol=binance_symbol,
+                    side=binance_side,
+                    type="LIMIT",
+                    quantity=quantity,
+                    price=float(price),
+                    timeInForce="GTC"
+                )
+            
+            logger.info(f"币安创建订单成功: {result}")
+            
+            return {
+                "order_id": str(result['orderId']),
+                "symbol": symbol,
+                "side": side,
+                "amount": float(amount),
+                "status": result['status'],
+                "filled_amount": float(result.get('executedQty', 0)),
+                "price": float(result.get('avgPrice', price or 0))
+            }
+        except ClientError as e:
+            logger.error(f"币安创建订单失败: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"币安创建订单异常: {e}")
+            return None
+    
+    async def cancel_order(self, symbol: str, order_id: str) -> bool:
+        """
+        取消订单
+        
+        Args:
+            symbol: 交易对
+            order_id: 订单ID
+            
+        Returns:
+            是否成功
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            self.client.cancel_order(symbol=binance_symbol, orderId=int(order_id))
+            logger.info(f"币安取消订单成功: {order_id}")
+            return True
+        except Exception as e:
+            logger.error(f"币安取消订单失败: {e}")
+            return False
+    
+    async def get_order_status(self, symbol: str, order_id: str) -> Optional[Dict]:
+        """
+        获取订单状态
+        
+        Args:
+            symbol: 交易对
+            order_id: 订单ID
+            
+        Returns:
+            订单状态信息
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            result = self.client.query_order(symbol=binance_symbol, orderId=int(order_id))
+            
+            return {
+                "order_id": str(result['orderId']),
+                "status": result['status'],
+                "filled_amount": float(result['executedQty'])
+            }
+        except Exception as e:
+            logger.error(f"获取币安订单状态失败: {e}")
+            return None
+    
+    async def get_position(self, symbol: str) -> Optional[Dict]:
+        """
+        获取持仓信息
+        
+        Args:
+            symbol: 交易对
+            
+        Returns:
+            持仓信息
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            result = self.client.get_position_risk(symbol=binance_symbol)
+            
+            if result:
+                position = result[0]
+                pos_amt = float(position['positionAmt'])
+                
+                if pos_amt == 0:
+                    side = None
+                elif pos_amt > 0:
+                    side = 'long'
+                else:
+                    side = 'short'
+                
+                return {
+                    "symbol": symbol,
+                    "side": side,
+                    "amount": abs(pos_amt),
+                    "entry_price": float(position['entryPrice']),
+                    "unrealized_pnl": float(position['unRealizedProfit']),
+                    "leverage": int(position['leverage'])
+                }
+            return None
+        except Exception as e:
+            logger.error(f"获取币安持仓信息失败: {e}")
+            return None
+    
+    async def get_balance(self) -> Optional[Decimal]:
+        """
+        获取账户余额
+        
+        Returns:
+            USDT 余额
+        """
+        try:
+            result = self.client.balance()
+            for asset in result:
+                if asset['asset'] == 'USDT':
+                    return Decimal(str(asset['availableBalance']))
+            return None
+        except Exception as e:
+            logger.error(f"获取币安余额失败: {e}")
+            return None
+    
+    async def set_stop_loss_take_profit(
+        self,
+        symbol: str,
+        side: str,
+        stop_loss_price: Optional[Decimal] = None,
+        take_profit_price: Optional[Decimal] = None
+    ) -> bool:
+        """
+        设置止损止盈
+        
+        Args:
+            symbol: 交易对
+            side: 持仓方向 'long' or 'short'
+            stop_loss_price: 止损价
+            take_profit_price: 止盈价
+            
+        Returns:
+            是否成功
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            
+            # 获取持仓数量
+            position = await self.get_position(symbol)
+            if not position or position['side'] != side:
+                logger.error("未找到对应持仓")
+                return False
+            
+            quantity = position['amount']
+            
+            # 止损单方向与持仓相反
+            if side == 'long':
+                sl_side = "SELL"
+                tp_side = "SELL"
+            else:
+                sl_side = "BUY"
+                tp_side = "BUY"
+            
+            # 设置止损
+            if stop_loss_price:
+                self.client.new_order(
+                    symbol=binance_symbol,
+                    side=sl_side,
+                    type="STOP_MARKET",
+                    stopPrice=float(stop_loss_price),
+                    closePosition=True
+                )
+                logger.info(f"币安设置止损成功: {symbol} @ {stop_loss_price}")
+            
+            # 设置止盈
+            if take_profit_price:
+                self.client.new_order(
+                    symbol=binance_symbol,
+                    side=tp_side,
+                    type="TAKE_PROFIT_MARKET",
+                    stopPrice=float(take_profit_price),
+                    closePosition=True
+                )
+                logger.info(f"币安设置止盈成功: {symbol} @ {take_profit_price}")
+            
+            return True
+        except Exception as e:
+            logger.error(f"币安设置止损止盈失败: {e}")
+            return False
+    
+    async def get_liquidation_price(self, symbol: str) -> Optional[Decimal]:
+        """
+        获取爆仓价格
+        
+        Args:
+            symbol: 交易对
+            
+        Returns:
+            爆仓价格
+        """
+        try:
+            binance_symbol = symbol.replace('USDC', 'USDT')
+            result = self.client.get_position_risk(symbol=binance_symbol)
+            
+            if result:
+                liquidation_price = Decimal(str(result[0]['liquidationPrice']))
+                return liquidation_price
+            return None
+        except Exception as e:
+            logger.error(f"获取币安爆仓价格失败: {e}")
+            return None
