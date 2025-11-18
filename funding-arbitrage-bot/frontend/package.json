@@ -1,0 +1,13 @@
+{
+  "name": "funding-arbitrage-frontend",
+  "version": "1.0.0",
+  "description": "Funding Rate Arbitrage Bot Frontend",
+  "scripts": {
+    "dev": "python3 -m http.server 3000",
+    "build": "echo 'Static HTML, no build needed'",
+    "start": "python3 -m http.server 3000"
+  },
+  "keywords": ["arbitrage", "funding-rate", "trading"],
+  "author": "",
+  "license": "MIT"
+}
